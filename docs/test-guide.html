@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<title>Test Guide — Hot Plugging</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2em auto; padding: 0 1em; line-height: 1.6; }
+pre { background: #1e1e2e; color: #cdd6f4; padding: 1em; border-radius: 6px; overflow-x: auto; font-size: .9em; }
+code { background: #f4f4f5; padding: .15em .4em; border-radius: 4px; font-size: .9em; }
+pre code { background: none; padding: 0; }
+h2 { margin-top: 2em; border-top: 2px solid #ddd; padding-top: .75em; }
+.step { background: #f0f7ff; border-left: 4px solid #2196f3; padding: .5em 1em; margin: 1em 0; border-radius: 4px; }
+.step strong { color: #1565c0; }
+.ok { color: #2e7d32; font-weight: bold; }
+.fail { color: #c62828; font-weight: bold; }
+.info { color: #1565c0; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #ddd; padding: .5em .75em; }
+th { background: #f4f4f5; }
+</style>
+</head>
+<body>
+
+<h1>Hướng dẫn kiểm thử Plug-and-Play</h1>
+<p>Kiểm tra tính năng tháo/lắp module nóng mà không restart server.</p>
+
+<p><strong>Yêu cầu:</strong> Node.js 20+, terminal, Postman / REST client bất kỳ</p>
+
+<hr>
+
+<h2>Bước 0: Build toàn bộ dự án</h2>
+
+<div class="step">
+<strong>Mở terminal tại thư mục gốc <code>exame/</code></strong>
+</div>
+
+<pre><code>npm install
+npm run build</code></pre>
+
+<p>Build thành công = 4 workspace đều in ra <code>tsc</code> không lỗi.</p>
+
+<hr>
+
+<h2>Bước 1: Khởi động Core Server</h2>
+
+<pre><code>npm run dev --workspace=@pluggable/core-server</code></pre>
+
+<p>Kết quả mong đợi:</p>
+<pre><code>[auth-module] DB ready
+Module loaded: auth-module v1.0.0
+[payment-module] DB ready, listening for user:created
+Module loaded: payment-module v1.0.0
+Watching: ...modules\*\dist
+Pluggable Backend Server started on port 3000
+Loaded: auth-module, payment-module</code></pre>
+
+<p class="ok">✓ Cả 2 module được load thành công</p>
+
+<hr>
+
+<h2>Bước 2: Kiểm tra module đang hoạt động</h2>
+
+<p><strong>Request:</strong></p>
+<pre><code>GET http://localhost:3000/health
+GET http://localhost:3000/modules
+
+→ 200
+{ "status": "running", "modules": ["auth-module", "payment-module"] }
+
+→ 200
+{ "modules": ["auth-module", "payment-module"] }</code></pre>
+
+<p class="ok">✓ Core Server sống, 2 modules sẵn sàng</p>
+
+<hr>
+
+<h2>Bước 3: Test API của 2 module</h2>
+
+<h3>3.1. Register & Login (auth-module)</h3>
+<pre><code>POST /api/v1/modules/auth-module/register
+Content-Type: application/json
+
+{ "username": "alice", "password": "secret" }
+
+→ 200
+{ "success": true, "message": "User registered" }
+
+
+POST /api/v1/modules/auth-module/login
+Content-Type: application/json
+
+{ "username": "alice", "password": "secret" }
+
+→ 200
+{ "success": true, "token": "mock-jwt-alice" }</code></pre>
+
+<p class="ok">✓ Auth-module: register + login, dữ liệu ghi vào <code>auth.db</code></p>
+<p class="info">ℹ Kiểm tra terminal server: in <code>[payment-module] Wallet created for alice</code> — Event Bus hoạt động</p>
+
+<h3>3.2. Checkout (payment-module)</h3>
+<pre><code>POST /api/v1/modules/payment-module/checkout
+Content-Type: application/json
+
+{ "amount": 29.99 }
+
+→ 200
+{ "success": true, "transactionId": "txn-1", "amount": 29.99, "currency": "USD" }</code></pre>
+
+<p class="ok">✓ Payment-module: checkout thành công</p>
+
+<hr>
+
+<h2>Bước 4: THÁO MODULE NÓNG (Hot Unplug)</h2>
+
+<p><strong>Mục tiêu:</strong> Xoá payment-module khi server đang chạy, kiểm tra Core không crash, auth vẫn hoạt động.</p>
+
+<div class="step">
+<strong>Mở terminal thứ hai (giữ nguyên server đang chạy).</strong> Xoá thư mục dist của payment-module:
+</div>
+
+<pre><code>rmdir /s /q modules\payment-module\dist</code></pre>
+
+<p>Kết quả trên terminal server:</p>
+<pre><code>Module unloaded: payment-module
+✓ Module unloaded: payment-module</code></pre>
+
+<p class="ok">✓ Server không crash, không restart</p>
+
+<h3>4.1. Kiểm tra payment-module đã biến mất</h3>
+<pre><code>GET /modules
+
+→ 200
+{ "modules": ["auth-module"] }</code></pre>
+
+<p class="ok">✓ payment-module không còn trong danh sách</p>
+
+<h3>4.2. Gọi API payment — phải trả về 404</h3>
+<pre><code>POST /api/v1/modules/payment-module/checkout
+Content-Type: application/json
+
+{ "amount": 10 }
+
+→ 404 Not Found
+&lt;!DOCTYPE html&gt;...Cannot POST /api/v1/modules/payment-module/checkout</code></pre>
+
+<p class="ok">✓ 404 — route đã bị gỡ, không crash, không undefined</p>
+
+<h3>4.3. Kiểm tra auth-module vẫn sống</h3>
+<pre><code>GET /health
+
+→ 200
+{ "status": "running", "modules": ["auth-module"] }
+
+
+POST /api/v1/modules/auth-module/login
+Content-Type: application/json
+
+{ "username": "alice", "password": "secret" }
+
+→ 200
+{ "success": true, "token": "mock-jwt-alice" }</code></pre>
+
+<p class="ok">✓ Core Server vẫn chạy, auth-module vẫn phục vụ request</p>
+
+<h3>4.4. Kiểm tra Event Bus an toàn</h3>
+<p>Đăng ký user mới — không có payment-module, không crash:</p>
+<pre><code>POST /api/v1/modules/auth-module/register
+Content-Type: application/json
+
+{ "username": "bob", "password": "pass" }
+
+→ 200
+{ "success": true, "message": "User registered" }</code></pre>
+
+<p class="ok">✓ Auth vẫn register được, emit vào bus không listener là no-op</p>
+
+<hr>
+
+<h2>Bước 5: LẮP MODULE NÓNG (Hot Plug)</h2>
+
+<p><strong>Mục tiêu:</strong> Đưa payment-module trở lại, server tự động load mà không restart.</p>
+
+<div class="step">
+<strong>Build lại payment-module:</strong>
+</div>
+
+<pre><code>cd exame
+npm run build --workspace=@pluggable/payment-module</code></pre>
+
+<p>Terminal server tự động in ra:</p>
+<pre><code>Module loaded: payment-module v1.0.0
+[payment-module] DB ready, listening for user:created</code></pre>
+
+<p class="ok">✓ Watcher phát hiện thư mục <code>dist/</code> mới → tự động load</p>
+
+<h3>5.1. Kiểm tra payment hoạt động trở lại</h3>
+<pre><code>GET /modules
+
+→ 200
+{ "modules": ["auth-module", "payment-module"] }
+
+
+POST /api/v1/modules/payment-module/checkout
+Content-Type: application/json
+
+{ "amount": 49.99 }
+
+→ 200
+{ "success": true, "transactionId": "txn-1", "amount": 49.99, "currency": "USD" }</code></pre>
+
+<p class="ok">✓ Payment-module hoạt động trở lại, không restart server</p>
+
+<h3>5.2. Kiểm tra database cũ vẫn còn</h3>
+<p>Vì payment.db được lưu ở <code>modules/payment-module/payment.db</code> (không nằm trong <code>dist/</code>), dữ liệu cũ không bị mất khi xoá <code>dist/</code>:</p>
+<pre><code>node -e "
+import('sql.js').then(m=>m.default()).then(SQL=>{
+  const {readFileSync}=require('fs');
+  const db=new SQL.Database(readFileSync('modules/payment-module/payment.db'));
+  console.log(JSON.stringify(db.exec('SELECT * FROM transactions')));
+})"</code></pre>
+
+<p class="ok">✓ Transactions cũ vẫn còn trong database</p>
+
+<hr>
+
+<h2>Bước 6: Kiểm tra Circuit Breaker</h2>
+
+<p><strong>Mục tiêu:</strong> Mô phỏng route handler ném lỗi — server không crash, trả về 503.</p>
+
+<div class="step">
+<strong>Tạm thời sửa <code>auth-module</code> để route login throw lỗi:</strong>
+</div>
+
+<pre><code>// modules/auth-module/src/index.ts — dòng ~30, thêm vào đầu execute():
+router.post('/crash', () =&gt; { throw new Error('Simulated crash'); });</code></pre>
+
+<pre><code>npm run build --workspace=@pluggable/auth-module</code></pre>
+
+<p class="info">ℹ Watcher phát hiện file <code>index.js</code> thay đổi → tự động reload module</p>
+
+<pre><code>POST /api/v1/modules/auth-module/crash
+
+→ 503
+{ "error": "auth-module temporarily unavailable" }</code></pre>
+
+<p>Kiểm tra server vẫn sống:</p>
+<pre><code>GET /health
+
+→ 200
+{ "status": "running", "modules": ["auth-module", "payment-module"] }</code></pre>
+
+<p class="ok">✓ Circuit Breaker hoạt động: error → 503, không crash</p>
+
+<p>Sau khi test, revert lại code, build lại.</p>
+
+<hr>
+
+<h2>Bước 7: Dọn dẹp</h2>
+
+<pre><code># Tắt server: Ctrl+C
+
+# Xoá database test
+del modules\auth-module\auth.db
+del modules\payment-module\payment.db</code></pre>
+
+<hr>
+
+<h2>Kịch bản test nhanh (copy-paste entire block)</h2>
+
+<pre><code>REM === Terminal 1: Start ===
+cd exame
+npm run build
+npm run dev --workspace=@pluggable/core-server
+
+REM === Terminal 2: Test ===
+curl http://localhost:3000/health
+
+curl -X POST http://localhost:3000/api/v1/modules/auth-module/register -H "Content-Type: application/json" -d "{\"username\":\"test\",\"password\":\"123\"}"
+
+curl -X POST http://localhost:3000/api/v1/modules/auth-module/login -H "Content-Type: application/json" -d "{\"username\":\"test\",\"password\":\"123\"}"
+
+curl -X POST http://localhost:3000/api/v1/modules/payment-module/checkout -H "Content-Type: application/json" -d "{\"amount\":15}"
+
+REM === Hot Unplug ===
+rmdir /s /q modules\payment-module\dist
+curl http://localhost:3000/modules
+
+REM === Hot Plug ===
+npm run build --workspace=@pluggable/payment-module
+curl http://localhost:3000/modules</code></pre>
+
+</body>
+</html>

@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pluggable Backend — Hướng dẫn</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 820px; margin: 2em auto; padding: 0 1em; line-height: 1.6; color: #222; }
+pre { background: #f4f4f5; padding: 1em; border-radius: 6px; overflow-x: auto; font-size: .9em; }
+code { background: #f4f4f5; padding: .15em .4em; border-radius: 4px; font-size: .9em; }
+pre code { background: none; padding: 0; }
+h2 { margin-top: 2em; border-top: 2px solid #ddd; padding-top: .75em; }
+h3 { margin-top: 1.5em; }
+.box { background: #f0f7ff; border-left: 4px solid #2196f3; padding: .75em 1em; border-radius: 4px; margin: 1em 0; }
+.warn { background: #fff8e1; border-left-color: #ff9800; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #ddd; padding: .5em .75em; text-align: left; }
+th { background: #f4f4f5; }
+</style>
+</head>
+<body>
+
+<h1>Pluggable Backend Architecture</h1>
+<p>Monorepo — TypeScript — Express — sql.js — In-Memory Event Bus</p>
+
+<h2>1. Tổng quan kiến trúc</h2>
+
+<p>Dự án theo mô hình <strong>Microkernel</strong>: một Core Server nhỏ gọn làm trung tâm, các module chức năng cắm vào/rút ra mà không cần restart.</p>
+
+<pre>
+<code>exame/
+├── shared-common/        ← Interface contracts (IPlugin, CoreContext, IEventBus)
+├── core-server/          ← Microkernel engine (ModuleManager, Dynamic Router, Circuit Breaker)
+└── modules/
+    ├── auth-module/      ← Module bắt buộc: SQLite users.db, login/register
+    └── payment-module/   ← Module tùy chọn: SQLite payment.db, checkout
+</code></pre>
+
+<table>
+<tr><th>Layer</th><th>Thư mục</th><th>Vai trò</th></tr>
+<tr><td>Contracts</td><td><code>shared-common/src/index.ts</code></td><td>Định nghĩa <code>IPlugin</code>, <code>CoreContext</code>, <code>IEventBus</code></td></tr>
+<tr><td>Engine</td><td><code>core-server/src/module-manager.ts</code></td><td>Quét thư mục, load/unload module bằng dynamic <code>import()</code>, watcher chokidar</td></tr>
+<tr><td>Engine</td><td><code>core-server/src/index.ts</code></td><td>Express server, Dynamic Router, Circuit Breaker, CoreContext khởi tạo</td></tr>
+<tr><td>Module</td><td><code>modules/*/src/index.ts</code></td><td>Triển khai <code>IPlugin</code>, mỗi module có SQLite DB riêng</td></tr>
+</table>
+
+<h2>2. Luồng hoạt động</h2>
+
+<h3>2.1. Khởi động</h3>
+
+<ol>
+<li><code>runner.ts</code> tạo <code>PluggableServer</code> với đường dẫn <code>../modules</code></li>
+<li>Constructor tạo: Express app, <code>ModuleManager</code>, <code>CoreContext</code> (console logger + EventEmitter)</li>
+<li><code>start()</code> gọi <code>ModuleManager.scanModules()</code> — quét mỗi thư mục con trong <code>modules/</code>, kiểm tra <code>dist/index.js</code></li>
+<li>Với mỗi module tìm thấy: <code>loadAndMount()</code></li>
+</ol>
+
+<h3>2.2. Load module</h3>
+
+<pre><code>ModuleManager.loadModule(moduleDir, context)
+ ├─ dynamic import(`file://...dist/index.js?t={timestamp}`)
+ ├─ kiểm tra duck-type: module?.name, .initialize, .execute, .shutdown
+ ├─ module.initialize(context)   ← mỗi module tự tạo SQLite DB
+ ├─ lưu vào Map<name, IPlugin>
+ └─ trả về module
+
+PluggableServer.loadAndMount(moduleDir)
+ ├─ ModuleManager.loadModule()
+ ├─ tạo Router mới
+ ├─ module.execute(router)       ← module đăng ký route handler
+ ├─ wrapRouterForCircuitBreaker() ← bọc mỗi handler bắt async error
+ ├─ app.use('/api/v1/modules/{name}', router)
+ └─ lưu router vào moduleRouters map
+</code></pre>
+
+<h3>2.3. Unload module</h3>
+
+<pre><code>PluggableServer.unloadAndUnmount(moduleName)
+  ├─ xoá router khỏi moduleRouters map
+  ├─ filter Express app._router.stack, bỏ layer có path /api/v1/modules/{name}
+  │  → request sau đó vào module này nhận 404, không crash
+  └─ ModuleManager.unloadModule(name)
+     ├─ module.shutdown()   ← module đóng SQLite DB, unsubscribe event bus
+     └─ xoá khỏi Map
+</code></pre>
+
+<h3>2.4. Luồng request — các trường hợp</h3>
+
+<h4>Trường hợp 1: Module đang hoạt động bình thường</h4>
+<pre><code>Client                          Core Server                     auth-module
+  │                                  │                              │
+  │  POST /api/v1/modules/           │                              │
+  │       auth-module/login          │                              │
+  │  ──────────────────────────────→ │                              │
+  │                                  │  app._router.stack có layer  │
+  │                                  │  path: /api/v1/modules/      │
+  │                                  │          auth-module         │
+  │                                  │  ───────────────────────────→│
+  │                                  │          router.post('/login', ...)
+  │                                  │          db.prepare('SELECT ...')
+  │                                  │                              │
+  │  ←────────────────────────────── │  res.json({ token })         │
+  │  200 {"token":"mock-jwt-alice"}  │                              │
+</code></pre>
+
+<h4>Trường hợp 2: Module đã bị unload</h4>
+<pre><code>Client                          Core Server
+  │                                  │
+  │  POST /api/v1/modules/           │
+  │       payment-module/checkout    │
+  │  ──────────────────────────────→ │
+  │                                  │  app._router.stack: không còn
+  │                                  │  layer payment-module nào
+  │                                  │  → không middleware nào match
+  │                                  │  → Express fallthrough: 404
+  │                                  │
+  │  ←────────────────────────────── │
+  │  404 Cannot POST /.../checkout   │
+</code></pre>
+<p class="info">Không crash, không undefined, không memory leak — chỉ đơn giản là route không tồn tại.</p>
+
+<h4>Trường hợp 3: Route handler ném lỗi (Circuit Breaker)</h4>
+<pre><code>Client                          Core Server                     auth-module
+  │                                  │                              │
+  │  POST /api/v1/modules/           │                              │
+  │       auth-module/crash          │                              │
+  │  ──────────────────────────────→ │                              │
+  │                                  │  router: wrapRouterFor       │
+  │                                  │  CircuitBreaker đã bọc       │
+  │                                  │  handler bằng wrapAsyncHandler│
+  │                                  │  ───────────────────────────→│
+  │                                  │    throw new Error('boom')   │
+  │                                  │  ←───────────────────────────│
+  │                                  │  async rejection → .catch(next)
+  │                                  │  → error middleware (4 params)
+  │                                  │  res.status(503).json(...)
+  │                                  │
+  │  ←────────────────────────────── │
+  │  503 {"error":"auth-module temporarily unavailable"}
+</code></pre>
+<p class="info">503 thay vì crash server. Các module khác không bị ảnh hưởng.</p>
+
+<h4>Trường hợp 4: Request sai path</h4>
+<pre><code>Client                          Core Server
+  │                                  │
+  │  GET /api/v1/modules/            │
+  │       auth-module/nonexistent    │
+  │  ──────────────────────────────→ │
+  │                                  │  Layer auth-module match,
+  │                                  │  chuyển vào router của module
+  │                                  │  → không route nào match
+  │                                  │  → 404 từ router nội bộ
+  │                                  │
+  │  ←────────────────────────────── │
+  │  404                              │
+</code></pre>
+
+<h4>Trường hợp 5: Event Bus — register kích hoạt wallet creation</h4>
+<pre><code>Client               Core Server          auth-module          payment-module
+  │                       │                    │                      │
+  │  POST /auth/register  │                    │                      │
+  │  ────────────────────→│                    │                      │
+  │                       │  loadAndMount →    │                      │
+  │                       │  module.execute() →│                      │
+  │                       │                    │                      │
+  │                       │                    │  INSERT INTO users   │
+  │                       │                    │  bus.emit(           │
+  │                       │                    │    'user:created',   │
+  │                       │                    │    {username}        │
+  │                       │                    │  ) ────────────────→ │
+  │                       │                    │                      │
+  │                       │                    │                      │  INSERT INTO wallets
+  │                       │                    │                      │  (username, balance=0)
+  │                       │                    │                      │
+  │  ←────────────────────│                    │                      │
+  │  200 {"success":true} │                    │                      │
+</code></pre>
+<p class="info">Hai module không import nhau, không biết đến nhau — chỉ giao tiếp qua Event Bus.</p>
+
+<h2>3. Hot Plugging — Tháo/lắp module nóng</h2>
+
+<div class="box">
+<strong>Hot plug</strong> = thêm/xoá thư mục module khi server đang chạy, không restart.
+</div>
+
+<h3>3.1. Watcher (chokidar)</h3>
+
+<p><code>ModuleManager.startWatcher()</code> theo dõi pattern <code>modules/*/dist</code>:</p>
+
+<table>
+<tr><th>Sự kiện</th><th>Hành động</th></tr>
+<tr><td>Thêm thư mục <code>dist/</code></td><td>Gọi <code>onLoad(moduleDir)</code> → load + mount</td></tr>
+<tr><td>Thêm file <code>index.js</code></td><td>Nếu module đã tồn tại: unload + load lại (reload code mới)</td></tr>
+<tr><td>Xoá thư mục <code>dist/</code></td><td>Gọi <code>onUnload(moduleName)</code> → unmount + shutdown</td></tr>
+</table>
+
+<p>Mỗi handler bọc trong <code>try-catch</code> riêng → một module lỗi không ảnh hưởng module khác.</p>
+
+<h3>3.2. Tại sao không crash?</h3>
+
+<ul>
+<li><strong>Module load lỗi</strong>: <code>loadModule()</code> throw → <code>loadAndMount()</code> trong <code>start()</code> có try-catch per module → log lỗi, skip, server tiếp tục</li>
+<li><strong>Route handler runtime lỗi</strong>: <code>wrapRouterForCircuitBreaker()</code> bọc mỗi handler → async rejection gọi <code>next(err)</code> → error middleware trả về 503 thay vì crash</li>
+<li><strong>Module unload</strong>: xoá layer khỏi Express stack → request sau vào module đó nhận 404 tự nhiên, không undefined route</li>
+<li><strong>Event emit khi module tắt</strong>: <code>EventEmitter.emit()</code> không listener là no-op; module dùng <code>bus?.emit()</code> optional chaining</li>
+</ul>
+
+<h2>4. In-Memory Event Bus</h2>
+
+<h3>4.1. Định nghĩa</h3>
+
+<p><strong>Event Bus</strong> là cơ chế giao tiếp giữa các module mà không cần import trực tiếp. Một module phát (emit) sự kiện, module khác lắng nghe (subscribe). Hai module hoàn toàn độc lập — không biết đến nhau.</p>
+
+<h3>4.2. Cài đặt</h3>
+
+<ul>
+<li>Interface <code>IEventBus</code> trong <code>shared-common/src/index.ts</code>: <code>on()</code>, <code>off()</code>, <code>emit()</code></li>
+<li>Triển khai: Node.js <code>EventEmitter</code> — built-in, không cần thư viện ngoài</li>
+<li>Instance duy nhất được tạo trong <code>PluggableServer</code> constructor, đưa vào <code>CoreContext</code></li>
+<li>Mọi module nhận <code>CoreContext</code> qua <code>initialize(context)</code> → cùng một EventEmitter</li>
+</ul>
+
+<h3>4.3. Luồng sự kiện</h3>
+
+<pre><code>auth-module                          payment-module
+     │                                     │
+     │  POST /api/v1/modules/auth/         │
+     │  register(username, password)       │
+     │       │                              │
+     │  INSERT INTO users ...              │
+     │  bus.emit('user:created', {         │
+     │    username                         │
+     │  }) ──────────────────────────────────→
+     │                                     │
+     │                          onUserCreated({ username })
+     │                          INSERT INTO wallets (username, balance)
+     │                          → Wallet tạo thành công
+     │                                     │
+     │  res.json({ success: true })        │
+</code></pre>
+
+<h3>4.4. An toàn khi module tắt</h3>
+
+<ul>
+<li>Payment-module lưu reference đến handler (<code>this.onUserCreated</code>)</li>
+<li>Khi <code>shutdown()</code>: gọi <code>bus.off('user:created', handler)</code> — unsubscribe, không leak memory</li>
+<li>Nếu payment-module chưa load: <code>bus.emit()</code> không có listener → không có gì xảy ra, auth vẫn hoạt động</li>
+<li>Nếu payment-module bị unload đột ngột: handler đã được gỡ, emit không gây lỗi</li>
+</ul>
+
+<h2>5. Đọc code theo thứ tự nào</h2>
+
+<div class="box warn">
+<strong>Mẹo:</strong> Đọc theo thứ tự này để hiểu từ contract → engine → module.
+</div>
+
+<ol>
+<li>
+<p><strong><code>shared-common/src/index.ts</code></strong> (28 dòng)</p>
+<p>Bắt đầu ở đây. Đây là hợp đồng giữa Core và Module. Hiểu <code>IPlugin</code>, <code>CoreContext</code>, <code>IEventBus</code>.</p>
+</li>
+
+<li>
+<p><strong><code>core-server/src/module-manager.ts</code></strong> (87 dòng)</p>
+<p>Trái tim của Microkernel: <code>scanModules()</code> quét thư mục, <code>loadModule()</code> dùng dynamic <code>import()</code> có cache-buster, <code>startWatcher()</code> dùng chokidar.</p>
+</li>
+
+<li>
+<p><strong><code>core-server/src/index.ts</code></strong> (90 dòng)</p>
+<p>Express server + Dynamic Router + Circuit Breaker. Xem <code>loadAndMount()</code> và <code>wrapRouterForCircuitBreaker()</code>.</p>
+</li>
+
+<li>
+<p><strong><code>modules/auth-module/src/index.ts</code></strong></p>
+<p>Module mẫu bắt buộc. Xem cách nó triển khai <code>IPlugin</code>, tự tạo SQLite DB trong <code>initialize()</code>, emit sự kiện sau register.</p>
+</li>
+
+<li>
+<p><strong><code>modules/payment-module/src/index.ts</code></strong></p>
+<p>Module mẫu tùy chọn. Xem cách nó subscribe event bus trong <code>initialize()</code>, unsubscribe trong <code>shutdown()</code>.</p>
+</li>
+</ol>
+
+<h3>5.1. Code map nhanh</h3>
+
+<table>
+<tr><th>File</th><th>Dòng</th><th>Xem</th></tr>
+<tr><td><code>shared-common/src/index.ts</code></td><td>10-13</td><td><code>IEventBus</code> interface</td></tr>
+<tr><td><code>shared-common/src/index.ts</code></td><td>21-27</td><td><code>IPlugin</code> interface</td></tr>
+<tr><td><code>core-server/src/module-manager.ts</code></td><td>7-16</td><td><code>scanModules()</code></td></tr>
+<tr><td><code>core-server/src/module-manager.ts</code></td><td>18-31</td><td><code>loadModule()</code> — dynamic import + duck-type check + initialize</td></tr>
+<tr><td><code>core-server/src/module-manager.ts</code></td><td>40-72</td><td><code>startWatcher()</code> — hot plug via chokidar</td></tr>
+<tr><td><code>core-server/src/index.ts</code></td><td>9-15</td><td><code>wrapAsyncHandler()</code> — bắt async rejection</td></tr>
+<tr><td><code>core-server/src/index.ts</code></td><td>17-26</td><td><code>wrapRouterForCircuitBreaker()</code> — 503 fallback</td></tr>
+<tr><td><code>core-server/src/index.ts</code></td><td>54-62</td><td><code>loadAndMount()</code> — load + execute + error wrapper + mount</td></tr>
+<tr><td><code>core-server/src/index.ts</code></td><td>64-71</td><td><code>unloadAndUnmount()</code> — xoá route + shutdown</td></tr>
+<tr><td><code>modules/auth-module/src/index.ts</code></td><td>57-58</td><td><code>bus.emit('user:created')</code></td></tr>
+<tr><td><code>modules/payment-module/src/index.ts</code></td><td>40-52</td><td><code>bus.on('user:created')</code> — subscribe + tạo wallet</td></tr>
+<tr><td><code>modules/payment-module/src/index.ts</code></td><td>72-75</td><td><code>bus.off()</code> — unsubscribe trong shutdown</td></tr>
+</table>
+
+<h2>6. Chạy thử</h2>
+
+<pre><code>cd core-server
+npm run dev          # build + start
+
+─── Register ──────────────────────────────────────────────
+POST /api/v1/modules/auth-module/register
+Content-Type: application/json
+
+{ "username": "test", "password": "123" }
+
+→ 200
+{ "success": true, "message": "User registered" }
+
+
+─── Login ─────────────────────────────────────────────────
+POST /api/v1/modules/auth-module/login
+Content-Type: application/json
+
+{ "username": "test", "password": "123" }
+
+→ 200
+{ "success": true, "token": "mock-jwt-test" }
+
+
+─── Checkout ──────────────────────────────────────────────
+POST /api/v1/modules/payment-module/checkout
+Content-Type: application/json
+
+{ "amount": 19.99 }
+
+→ 200
+{ "success": true, "transactionId": "txn-1", "amount": 19.99, "currency": "USD" }
+
+
+─── Hot Unplug ────────────────────────────────────────────
+# Xoá dist — watcher tự động unload
+rmdir /s /q ..\modules\payment-module\dist
+
+→ Server log: Module unloaded: payment-module
+
+GET /modules
+
+→ 200
+{ "modules": ["auth-module"] }
+
+→ /checkout trả về 404, auth vẫn hoạt động
+
+
+─── Hot Plug ──────────────────────────────────────────────
+npm run build --workspace=@pluggable/payment-module
+
+→ Server log: Module loaded: payment-module
+→ Watcher phát hiện dist/ mới, tự động load + mount
+
+GET /modules
+
+→ 200
+{ "modules": ["auth-module", "payment-module"] }
+</code></pre>
+
+</body>
+</html>

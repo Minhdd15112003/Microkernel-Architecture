@@ -1,0 +1,23 @@
+{
+  "name": "pluggable-backend",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "core-server",
+    "shared-common",
+    "modules/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev": "npm run dev --workspace=core-server",
+    "unplug": "if exist modules\\%npm_config_module%\\dist rd /s /q modules\\%npm_config_module%\\dist",
+    "plug": "if exist modules\\%npm_config_module%\\tsconfig.tsbuildinfo del modules\\%npm_config_module%\\tsconfig.tsbuildinfo && npm run build --workspace=@pluggable/%npm_config_module%"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@dietrichgebert/ponytail": "^4.8.4"
+  }
+}
