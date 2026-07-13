@@ -32,10 +32,6 @@ export class AuthModule implements IPlugin {
   }
 
   async execute(router: Router): Promise<void> {
-    // router.get("/helo", (req, res) => {
-    //   res.json({ message: "bbbbbbbbbbbbbbbbb" });
-    // });
-
     router.post("/login", (req, res) => {
       const { username, password } = req.body || {};
       if (!username || !password) {
