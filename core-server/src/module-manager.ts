@@ -6,10 +6,6 @@ import { existsSync, readdirSync } from 'fs';
 
 export class ModuleManager {
   private loadedModules: Map<string, IPlugin> = new Map();
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
-  private modulesPath: string = '';
-  private onLoadCallback: ((moduleDir: string) => Promise<void>) | null = null;
-  private onUnloadCallback: ((moduleName: string) => Promise<void>) | null = null;
 
   scanModules(basePath: string): string[] {
     const dirs: string[] = [];
@@ -50,12 +46,9 @@ export class ModuleManager {
     onLoad: (moduleDir: string) => Promise<void>,
     onUnload: (moduleName: string) => Promise<void>
   ): void {
-    this.modulesPath = modulesPath;
-    this.onLoadCallback = onLoad;
-    this.onUnloadCallback = onUnload;
-
     const pattern = join(modulesPath, '*', 'dist');
-    const watcher = watch(pattern, { ignoreInitial: true, depth: 1 });
+    // ponytail: usePolling=true for Windows where fs.watch event delivery is unreliable
+    const watcher = watch(pattern, { ignoreInitial: true, depth: 1, usePolling: true });
 
     watcher.on('addDir', async (dirPath) => {
       if (!dirPath.endsWith('dist')) return;
@@ -111,28 +104,7 @@ export class ModuleManager {
       }
     });
 
-    // ponytail: periodic poll fallback for platforms where fs.watch events don't fire reliably
-    this.pollTimer = setInterval(() => this.pollModules(), 2000);
-
     console.log(`Watching: ${pattern}`);
-  }
-
-  private pollModules(): void {
-    // Check loaded modules — unload if dist/index.js is gone
-    for (const [name, _module] of this.loadedModules) {
-      const distIndex = join(this.modulesPath, name, 'dist', 'index.js');
-      if (!existsSync(distIndex)) {
-        this.onUnloadCallback?.(name);
-      }
-    }
-    // Scan for new dist/ directories that watcher may have missed
-    for (const entry of readdirSync(this.modulesPath, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const distIndex = join(this.modulesPath, entry.name, 'dist', 'index.js');
-      if (existsSync(distIndex) && !this.loadedModules.has(entry.name)) {
-        this.onLoadCallback?.(join(this.modulesPath, entry.name));
-      }
-    }
   }
 
   getLoadedModules(): string[] {
